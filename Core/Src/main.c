@@ -258,7 +258,7 @@ static float enc_to_rad(int32_t cnt)
 static float pi_calc(PI_t *pi, float err, float dt)
 {
     /* Deadband ±50mA: destroy noise, reset Cumulative Integration */
-    if (fabsf(err) < 50.0f)
+    if (fabsf(err) < 150.0f)
     {
         pi->integ = 0.0f;
         return 0.0f;
@@ -377,15 +377,15 @@ static void System_Init(void)
 
 static void Calibrate_ADC_Offset(void)
 {
-    HAL_Delay(50);   /* chờ ADC DMA ổn định */
+    HAL_Delay(1000);   /* chờ ADC DMA ổn định */
     uint32_t acc[NUM_MOTORS] = {0, 0, 0};
-    for (uint16_t s = 0; s < 500u; s++) {
+    for (uint16_t s = 0; s < 1000u; s++) {
         for (uint8_t m = 0; m < NUM_MOTORS; m++)
             acc[m] += adc_dma[m];
         HAL_Delay(1);
     }
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
-        adc_offset[m] = (uint16_t)(acc[m] / 500u);
+        adc_offset[m] = (uint16_t)(acc[m] / 1000u);
 }
 
 /* ════════════════════════════════════════════════════════════════

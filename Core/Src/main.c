@@ -42,7 +42,8 @@ static uint16_t  adc_dma[NUM_MOTORS];   /* DMA write samplel ADc*/
 static uint8_t  rx_byte;
 static char     rx_line[RX_SZ];
 static uint8_t  rx_idx = 0;
-static char     tx_buf[TX_SZ];
+static char     tx_buf[2][TX_SZ];   /* double buffer tránh ghi đè khi DMA đang gửi */
+static uint8_t  tx_sel = 0;         /* buffer đang dùng để ghi */
 
 /* ── Ctrl loop ────────────────────────────────────────────────── */
 static uint8_t  ctrl_cnt = 0;
@@ -130,37 +131,63 @@ int main(void)
 #define UART_DIV    10u     /* gửi UART mỗi 10 vòng PI × 1ms = 10ms → 100 gói/s */
 static uint8_t uart_cnt = 0;
 
+/* ── Soft-start: bỏ qua lệnh Unity trong 2s đầu sau SYS_RUN ─── */
+#define SOFTSTART_MS    2000u
+static uint32_t softstart_cnt = 0u;
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    /*check timer and state system*/
     if (htim->Instance != TIM10) return;
     if (sys_state != SYS_RUN)   return;
 
-    /* get sample ADC <N_ADC>(samples) */
+    /* Soft-start: giữ current_ref = 0 trong SOFTSTART_MS đầu */
+    if (softstart_cnt < SOFTSTART_MS) {
+        softstart_cnt++;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) {
+            motors[m].pi.integ = 0.0f;
+            motor_set(m, 0.0f, 0u);
+        }
+        return;
+    }
+
+    /* Lấy mẫu ADC */
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
         motors[m].adc[ctrl_cnt] = adc_dma[m];
-    /*oversampling + moving Average techninche*/
     if (++ctrl_cnt < ADC_N) return;
     ctrl_cnt = 0;
 
-    /* control loop */
+    /* --- VÒNG LẶP ĐIỀU KHIỂN: 2 TRƯỜNG HỢP --- */
     for (uint8_t m = 0; m < NUM_MOTORS; m++) {
-        motors[m].current_mA = adc_to_mA(
-            (uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
+        // Đọc dòng điện và góc
+        motors[m].current_mA = adc_to_mA((uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
         motors[m].angle_rad = enc_to_rad(enc_read(m));
-        
-        /*calculate current from formular gravity compession*/
-        float i_grav = K_GRAVITY_MA  * cosf(motors[m].angle_rad);
-        float total_ref_mA = motors[m].current_ref_mA + i_grav;
-        
-        float err = total_ref_mA - motors[m].current_mA;
-        float out = pi_calc(&motors[m].pi, err, TS);
 
-        motor_set(m,
-                  out >= 0.0f ? out  : -out,
-                  out >= 0.0f ? 0u   : 1u);
+        /* KIỂM TRA 2 TRƯỜNG HỢP (Ý tưởng của bạn) */
+        // Dùng một ngưỡng nhỏ (ví dụ 10mA) để lọc sạch các số rác từ Unity
+        if (fabsf(motors[m].current_ref_mA) < 5.0f) 
+        {
+            // TRƯỜNG HỢP 1: KHÔNG VA CHẠM (LÚC THƯỜNG)
+            // 1. Xóa sạch bộ nhớ tích phân PI để không bị cộng dồn nhiễu
+            motors[m].pi.integ = 0.0f; 
+            
+            // 2. Ép xuất thẳng PWM = 0 (Động cơ tắt hoàn toàn, thả lỏng)
+            motor_set(m, 0.0f, 0u);
+        }
+        else 
+        {
+            // TRƯỜNG HỢP 2: CÓ VA CHẠM (DÒNG ĐIỆN LỚN)
+            // 1. Tính toán sai số
+            float err = motors[m].current_ref_mA - motors[m].current_mA;
+            
+            // 2. Chạy bộ PI
+            float out = pi_calc(&motors[m].pi, err, TS);
+            
+            // 3. Xuất lực ra động cơ
+            motor_set(m, out >= 0.0f ? out : -out, out >= 0.0f ? 0u : 1u);
+        }
     }
 
+    /* Gửi dữ liệu UART lên Unity */
     if (++uart_cnt >= UART_DIV) {
         uart_cnt = 0;
         uart_send();
@@ -174,9 +201,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART2)
         return;
+        
     uint8_t b = rx_byte;
+    
     /* UNITY's Reset comand  */
     HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+    
+    /* 1. BỎ QUA KÝ TỰ \r NẾU UNITY GỬI WRITELINE (\r\n) */
+    if (b == '\r') return;
+
     if (rx_idx < RX_SZ - 1)
     {
         rx_line[rx_idx++] = (char)b;
@@ -188,44 +221,49 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         memset(rx_line, 0, RX_SZ);
         return;
     }
+    
     if (b != '\n')
         return;
+        
+    // Chốt chuỗi: Lúc này rx_line sạch sẽ, chỉ chứa dữ liệu, không có \r hay \n
     rx_line[rx_idx] = '\0';
-    if (rx_line[0] == 'R')
-    {
-        __HAL_TIM_SET_COUNTER(&htim5, 0U);
-        __HAL_TIM_SET_COUNTER(&htim2, 0U);
-        __HAL_TIM_SET_COUNTER(&htim4, 0U);
-        motors[0].angle_rad = 0.0f;
-        motors[1].angle_rad = 0.0f;
-        motors[2].angle_rad = 0.0f;
-        rx_idx = 0;
-        memset(rx_line, 0, RX_SZ);
-        return;
+
+    /* 2. ÉP BUỘC ĐỔI DẤU PHẨY THÀNH DẤU CHẤM */
+    // Đề phòng máy tính Windows của bạn đang dùng ngôn ngữ VN (12,5 thay vì 12.5)
+    for (uint8_t i = 0; i < rx_idx; i++) {
+        if (rx_line[i] == ',') {
+            rx_line[i] = '.';
+        }
     }
-    int v0 = 0;
-    int v1 = 0;
-    int v2 = 0;
-    if (sscanf(rx_line, "%d;%d;%d", &v0, &v1, &v2) == 3)
+
+    /* 4. GIẢI MÃ DỮ LIỆU */
+    float v0 = 0.0f;
+    float v1 = 0.0f;
+    float v2 = 0.0f;
+    
+    // Nếu sscanf giải mã thành công 3 số thực
+    if (sscanf(rx_line, "%f;%f;%f", &v0, &v1, &v2) == 3)
     {
         float limit = ICLAMP;
-        if (v0 > limit)
-            v0 = limit;
-        else if (v0 < -limit)
-            v0 = -limit;
-        if (v1 > limit)
-            v1 = limit;
-        else if (v1 < -limit)
-            v1 = -limit;
-        if (v2 > limit)
-            v2 = limit;
-        else if (v2 < -limit)
-            v2 = -limit;
-        motors[0].current_ref_mA = (float)v0;
-        motors[1].current_ref_mA = (float)v1;
-        motors[2].current_ref_mA = (float)v2;
+        if (v0 > limit) v0 = limit; else if (v0 < -limit) v0 = -limit;
+        if (v1 > limit) v1 = limit; else if (v1 < -limit) v1 = -limit;
+        if (v2 > limit) v2 = limit; else if (v2 < -limit) v2 = -limit;
+
+        motors[0].current_ref_mA = v0;
+        motors[1].current_ref_mA = v1;
+        motors[2].current_ref_mA = v2;
+        
+        char dbg[64];
+        int len = snprintf(dbg, sizeof(dbg), "OK: %.2f %.2f %.2f\r\n", v0, v1, v2);
+        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 100);
     }
-    rx_idx = 0;
+    else 
+    {
+        // Báo lỗi nếu Unity gửi sai format
+        HAL_UART_Transmit(&huart2, (uint8_t*)"SSCANF_FAIL\r\n", 13, 100);
+    }
+    
+    rx_idx = 0; // Đặt lại index cho gói dữ liệu tiếp theo
 }
 /* ════════════════════════════════════════════════════════════════
  *  LOCAL FUNC 
@@ -261,7 +299,7 @@ static float enc_to_rad(int32_t cnt)
 
 static float pi_calc(PI_t *pi, float err, float dt)
 {
-    /* Deadband ±50mA: destroy noise, reset Cumulative Integration */
+    /* Deadband ±150mA: lọc noise ADC, lực dưới ~1N không cảm nhận được */
     if (fabsf(err) < 150.0f)
     {
         pi->integ = 0.0f;
@@ -334,11 +372,11 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 static void uart_send(void)
 {
-    if (dma_tx_busy) 
-    {
-        return;
-    };   /* DMA full stack, skip frame */
-    
+    if (dma_tx_busy) return;   /* DMA còn bận, bỏ qua frame này */
+
+    /* Ghi vào buffer không dùng */
+    uint8_t buf = tx_sel ^ 1u;
+    char *p = tx_buf[buf];
 
     float d0 = motors[0].angle_rad * (180.0f / (float)M_PI);
     float d1 = motors[1].angle_rad * (180.0f / (float)M_PI);
@@ -347,7 +385,6 @@ static void uart_send(void)
     float c1 = motors[1].current_mA;
     float c2 = motors[2].current_mA;
 
-    char *p = tx_buf;
     p += fmt_f2(p, d0); *p++ = ';';
     p += fmt_f2(p, d1); *p++ = ';';
     p += fmt_f2(p, d2); *p++ = ';';
@@ -355,9 +392,10 @@ static void uart_send(void)
     p += fmt_f2(p, c1); *p++ = ';';
     p += fmt_f2(p, c2); *p++ = '\n';
 
-    uint16_t len = (uint16_t)(p - tx_buf);
+    uint16_t len = (uint16_t)(p - tx_buf[buf]);
+    tx_sel = buf;
     dma_tx_busy = 1;
-    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buf, len) != HAL_OK)
+    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buf[buf], len) != HAL_OK)
         dma_tx_busy = 0;
 }
 
@@ -563,9 +601,9 @@ static void MX_USART2_Init(void)
     HAL_DMA_Init(&hdma_uart_tx);
     __HAL_LINKDMA(&huart2, hdmatx, hdma_uart_tx);
 
-    HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 2, 0);  /* TX DMA - priority thấp hơn */
     HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
 
-    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);         /* RX - priority cao hơn TX */
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 }

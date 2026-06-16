@@ -14,16 +14,14 @@ extern "C" {
 
 #define NUM_MOTORS      3
 #define COUNTS_PER_REV  8000u   /* 200PPR × 4 × 10 capstan */
-#define PWM_ARR         4199u   /* 84MHz/4200 = 20kHz */
-
-#define K_GRAVITY_MA    250.0f /*const gravity compensation*/
+#define PWM_ARR         4199u   /* 84MHz/4200 = 20kHz */ 
 
 /* ACS712-05B */
 #define ACS_VREF        2.5f
 #define ACS_SENS        0.185f
 #define ADC_VREF        3.3f
 #define ADC_FS          4096.0f
-#define ICLAMP          2000.0f
+#define ICLAMP          5000.0f
 
 /* controll loop
  * ADC_N=100 × 10µs = Ts=100ms ← τ/10 

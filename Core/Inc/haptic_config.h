@@ -16,6 +16,8 @@ extern "C" {
 #define COUNTS_PER_REV  8000u   /* 200PPR × 4 × 10 capstan */
 #define PWM_ARR         4199u   /* 84MHz/4200 = 20kHz */
 
+#define K_GRAVITY_MA    250.0f /*const gravity compensation*/
+
 /* ACS712-05B */
 #define ACS_VREF        2.5f
 #define ACS_SENS        0.185f

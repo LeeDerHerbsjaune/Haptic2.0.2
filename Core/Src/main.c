@@ -148,8 +148,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         motors[m].current_mA = adc_to_mA(
             (uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
         motors[m].angle_rad = enc_to_rad(enc_read(m));
-
-        float err = motors[m].current_ref_mA - motors[m].current_mA;
+        
+        /*calculate current from formular gravity compession*/
+        float i_grav = K_GRAVITY_MA  * cosf(motors[m].angle_rad);
+        float total_ref_mA = motors[m].current_ref_mA + i_grav;
+        
+        float err = total_ref_mA - motors[m].current_mA;
         float out = pi_calc(&motors[m].pi, err, TS);
 
         motor_set(m,

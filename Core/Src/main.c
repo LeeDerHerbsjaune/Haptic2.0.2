@@ -132,35 +132,47 @@ static uint8_t uart_cnt = 0;
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    /*check timer and state system*/
     if (htim->Instance != TIM10) return;
     if (sys_state != SYS_RUN)   return;
 
-    /* get sample ADC <N_ADC>(samples) */
+    /* Lấy mẫu ADC */
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
         motors[m].adc[ctrl_cnt] = adc_dma[m];
-    /*oversampling + moving Average techninche*/
     if (++ctrl_cnt < ADC_N) return;
     ctrl_cnt = 0;
 
-    /* control loop */
+    /* --- VÒNG LẶP ĐIỀU KHIỂN: 2 TRƯỜNG HỢP --- */
     for (uint8_t m = 0; m < NUM_MOTORS; m++) {
-        motors[m].current_mA = adc_to_mA(
-            (uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
+        // Đọc dòng điện và góc
+        motors[m].current_mA = adc_to_mA((uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
         motors[m].angle_rad = enc_to_rad(enc_read(m));
-        
-        /*calculate current from formular gravity compession*/
-        float i_grav = K_GRAVITY_MA  * cosf(motors[m].angle_rad);
-        float total_ref_mA = motors[m].current_ref_mA + i_grav;
-        
-        float err = total_ref_mA - motors[m].current_mA;
-        float out = pi_calc(&motors[m].pi, err, TS);
 
-        motor_set(m,
-                  out >= 0.0f ? out  : -out,
-                  out >= 0.0f ? 0u   : 1u);
+        /* KIỂM TRA 2 TRƯỜNG HỢP (Ý tưởng của bạn) */
+        // Dùng một ngưỡng nhỏ (ví dụ 10mA) để lọc sạch các số rác từ Unity
+        if (fabsf(motors[m].current_ref_mA) < 5.0f) 
+        {
+            // TRƯỜNG HỢP 1: KHÔNG VA CHẠM (LÚC THƯỜNG)
+            // 1. Xóa sạch bộ nhớ tích phân PI để không bị cộng dồn nhiễu
+            motors[m].pi.integ = 0.0f; 
+            
+            // 2. Ép xuất thẳng PWM = 0 (Động cơ tắt hoàn toàn, thả lỏng)
+            motor_set(m, 0.0f, 0u);
+        }
+        else 
+        {
+            // TRƯỜNG HỢP 2: CÓ VA CHẠM (DÒNG ĐIỆN LỚN)
+            // 1. Tính toán sai số
+            float err = motors[m].current_ref_mA - motors[m].current_mA;
+            
+            // 2. Chạy bộ PI
+            float out = pi_calc(&motors[m].pi, err, TS);
+            
+            // 3. Xuất lực ra động cơ
+            motor_set(m, out >= 0.0f ? out : -out, out >= 0.0f ? 0u : 1u);
+        }
     }
 
+    /* Gửi dữ liệu UART lên Unity */
     if (++uart_cnt >= UART_DIV) {
         uart_cnt = 0;
         uart_send();
@@ -203,10 +215,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         memset(rx_line, 0, RX_SZ);
         return;
     }
-    int v0 = 0;
-    int v1 = 0;
-    int v2 = 0;
-    if (sscanf(rx_line, "%d;%d;%d", &v0, &v1, &v2) == 3)
+    float v0 = 0.0f;
+    float v1 = 0.0f;
+    float v2 = 0.0f;
+    if (sscanf(rx_line, "%f;%f;%f", &v0, &v1, &v2) == 3)
     {
         float limit = ICLAMP;
         if (v0 > limit)
@@ -221,9 +233,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             v2 = limit;
         else if (v2 < -limit)
             v2 = -limit;
-        motors[0].current_ref_mA = (float)v0;
-        motors[1].current_ref_mA = (float)v1;
-        motors[2].current_ref_mA = (float)v2;
+
+        float hw_gain = 3.0f;
+        motors[0].current_ref_mA = (float)v0 * hw_gain;
+        motors[1].current_ref_mA = (float)v1* hw_gain;
+        motors[2].current_ref_mA = (float)v2* hw_gain;
     }
     rx_idx = 0;
 }

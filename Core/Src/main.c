@@ -75,6 +75,7 @@ static float    pi_calc(PI_t *pi, float err, float dt);
 static void     motor_set(uint8_t m, float duty, uint8_t dir);
 static uint8_t  fmt_f2(char *buf, float v);
 static void     uart_send(void);
+static uint8_t  parse_3int(const char *s, float *v0, float *v1, float *v2);
 
 /* ════════════════════════════════════════════════════════════════
  *  MAIN
@@ -199,16 +200,32 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
  * ════════════════════════════════════════════════════════════════ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance != USART2)
-        return;
+    if (huart->Instance != USART2) return;
         
     uint8_t b = rx_byte;
     
-    /* UNITY's Reset comand  */
+    // Bật lại ngắt nhận byte tiếp theo NGAY LẬP TỨC
     HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
     
-    /* 1. BỎ QUA KÝ TỰ \r NẾU UNITY GỬI WRITELINE (\r\n) */
     if (b == '\r') return;
+    if (b == '\n')
+    {
+        rx_line[rx_idx] = '\0';     /* null-terminate TRƯỚC \n — không lưu \n vào buffer */
+        rx_idx = 0;
+
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f;
+        if (parse_3int(rx_line, &v0, &v1, &v2))
+        {
+            float limit = (float)ICLAMP;
+            if (v0 >  limit) v0 =  limit; else if (v0 < -limit) v0 = -limit;
+            if (v1 >  limit) v1 =  limit; else if (v1 < -limit) v1 = -limit;
+            if (v2 >  limit) v2 =  limit; else if (v2 < -limit) v2 = -limit;
+            motors[0].current_ref_mA = v0 * GAIN;
+            motors[1].current_ref_mA = v1 * GAIN;
+            motors[2].current_ref_mA = v2 * GAIN;
+        }
+        return;
+    }
 
     if (rx_idx < RX_SZ - 1)
     {
@@ -216,58 +233,28 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
     else
     {
-        /* Buffer overflow -> reset */
-        rx_idx = 0;
-        memset(rx_line, 0, RX_SZ);
-        return;
+        rx_idx = 0;     /* tràn buffer: bỏ frame lỗi, chờ frame mới */
     }
-    
-    if (b != '\n')
-        return;
-        
-    // Chốt chuỗi: Lúc này rx_line sạch sẽ, chỉ chứa dữ liệu, không có \r hay \n
-    rx_line[rx_idx] = '\0';
-
-    /* 2. ÉP BUỘC ĐỔI DẤU PHẨY THÀNH DẤU CHẤM */
-    // Đề phòng máy tính Windows của bạn đang dùng ngôn ngữ VN (12,5 thay vì 12.5)
-    for (uint8_t i = 0; i < rx_idx; i++) {
-        if (rx_line[i] == ',') {
-            rx_line[i] = '.';
-        }
-    }
-
-    /* 4. GIẢI MÃ DỮ LIỆU */
-    float v0 = 0.0f;
-    float v1 = 0.0f;
-    float v2 = 0.0f;
-    
-    // Nếu sscanf giải mã thành công 3 số thực
-    if (sscanf(rx_line, "%f;%f;%f", &v0, &v1, &v2) == 3)
-    {
-        float limit = ICLAMP;
-        if (v0 > limit) v0 = limit; else if (v0 < -limit) v0 = -limit;
-        if (v1 > limit) v1 = limit; else if (v1 < -limit) v1 = -limit;
-        if (v2 > limit) v2 = limit; else if (v2 < -limit) v2 = -limit;
-
-        motors[0].current_ref_mA = v0;
-        motors[1].current_ref_mA = v1;
-        motors[2].current_ref_mA = v2;
-        
-        char dbg[64];
-        int len = snprintf(dbg, sizeof(dbg), "OK: %.2f %.2f %.2f\r\n", v0, v1, v2);
-        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 100);
-    }
-    else 
-    {
-        // Báo lỗi nếu Unity gửi sai format
-        HAL_UART_Transmit(&huart2, (uint8_t*)"SSCANF_FAIL\r\n", 13, 100);
-    }
-    
-    rx_idx = 0; // Đặt lại index cho gói dữ liệu tiếp theo
 }
 /* ════════════════════════════════════════════════════════════════
- *  LOCAL FUNC 
+ *  LOCAL FUNC
  * ════════════════════════════════════════════════════════════════ */
+
+/* Parse "±NNNN;±NNNN;±NNNN\n" — safe in ISR: no malloc, no locale, <50B stack */
+static uint8_t parse_3int(const char *s, float *v0, float *v1, float *v2)
+{
+    float *dst[3] = { v0, v1, v2 };
+    for (uint8_t i = 0; i < 3; i++) {
+        int32_t val = 0;
+        int8_t  neg = 0;
+        if (*s == '-') { neg = 1; s++; }
+        if (*s < '0' || *s > '9') return 0;
+        while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
+        *dst[i] = neg ? -(float)val : (float)val;
+        if (i < 2) { if (*s != ';') return 0; s++; }
+    }
+    return 1;
+}
 
 static float adc_to_mA(uint16_t raw, uint16_t offset)
 {
@@ -384,13 +371,19 @@ static void uart_send(void)
     float c0 = motors[0].current_mA;
     float c1 = motors[1].current_mA;
     float c2 = motors[2].current_mA;
+    float r0 = motors[0].current_ref_mA;   /* DEBUG: ref Unity gửi xuống */
+    float r1 = motors[1].current_ref_mA;
+    float r2 = motors[2].current_ref_mA;
 
     p += fmt_f2(p, d0); *p++ = ';';
     p += fmt_f2(p, d1); *p++ = ';';
     p += fmt_f2(p, d2); *p++ = ';';
     p += fmt_f2(p, c0); *p++ = ';';
     p += fmt_f2(p, c1); *p++ = ';';
-    p += fmt_f2(p, c2); *p++ = '\n';
+    p += fmt_f2(p, c2); *p++ = ';';
+    p += fmt_f2(p, r0); *p++ = ';';
+    p += fmt_f2(p, r1); *p++ = ';';
+    p += fmt_f2(p, r2); *p++ = '\n';
 
     uint16_t len = (uint16_t)(p - tx_buf[buf]);
     tx_sel = buf;

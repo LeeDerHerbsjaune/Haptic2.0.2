@@ -4,10 +4,11 @@
     "command": "C:/Program Files (x86)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
     "args": [
         "-c",
-        "port=USB1",
+        "port=SWD",
         "-w",
         "${workspaceFolder}/build/Debug/Haptic2.0.2.elf",
         "-v",
+        "-rst"
     ],
     "problemMatcher": []
 }

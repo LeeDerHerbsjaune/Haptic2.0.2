@@ -38,18 +38,26 @@ static Motor_t   motors[NUM_MOTORS];
 static State_t   sys_state = SYS_IDLE;
 static uint16_t  adc_dma[NUM_MOTORS];   /* DMA write samplel ADc*/
 
-/* ── UART buffers ─────────────────────────────────────────────── */
-static uint8_t  rx_byte;
-static char     rx_line[RX_SZ];
-static uint8_t  rx_idx = 0;
+/* ── UART TX buffers ──────────────────────────────────────────── */
 static char     tx_buf[2][TX_SZ];   /* double buffer tránh ghi đè khi DMA đang gửi */
-static uint8_t  tx_sel = 0;         /* buffer đang dùng để ghi */
+static uint8_t  tx_sel = 0;
 
 /* ── Ctrl loop ────────────────────────────────────────────────── */
 static uint8_t  ctrl_cnt = 0;
 
 /* ── ACS712 calib sensor when start peripheral */
 static uint16_t adc_offset[NUM_MOTORS] = {2048u, 2048u, 2048u};
+
+/* ── UART RX ──────────────────────────────────────────────────── */
+static uint8_t          rx_byte;
+static char             rx_line[RX_SZ];
+static uint8_t          rx_idx  = 0u;
+static volatile float   rx_val[3];         /* last parsed values from Unity */
+static volatile uint8_t rx_ready = 0u;     /* 1 = new data available */
+
+/* ── Logging counters ─────────────────────────────────────────── */
+static volatile uint32_t log_rx_ok  = 0u;  /* packets parsed OK */
+static volatile uint32_t log_rx_err = 0u;  /* parse errors / buffer overflow */
 
 /* ════════════════════════════════════════════════════════════════
  *  PROTOTYPE LOCAL
@@ -71,7 +79,6 @@ static void     Calibrate_ADC_Offset(void);
 static float    filter_avg(volatile uint16_t *buf, uint16_t n);
 static int32_t  enc_read(uint8_t m);
 static float    enc_to_rad(int32_t cnt);
-static float    pi_calc(PI_t *pi, float err, float dt);
 static void     motor_set(uint8_t m, float duty, uint8_t dir);
 static uint8_t  fmt_f2(char *buf, float v);
 static void     uart_send(void);
@@ -119,9 +126,9 @@ int main(void)
     __HAL_TIM_SET_COUNTER(&htim4, 0u);
 
     HAL_TIM_Base_Start_IT(&htim10);
-    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
 
     sys_state = SYS_RUN;
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   /* bắt đầu nhận UART từ Unity */
     while (1) {}
 }
 
@@ -141,13 +148,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim->Instance != TIM10) return;
     if (sys_state != SYS_RUN)   return;
 
-    /* Soft-start: giữ current_ref = 0 trong SOFTSTART_MS đầu */
+    /* Soft-start: giữ motor tắt trong SOFTSTART_MS đầu */
     if (softstart_cnt < SOFTSTART_MS) {
         softstart_cnt++;
-        for (uint8_t m = 0; m < NUM_MOTORS; m++) {
-            motors[m].pi.integ = 0.0f;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
             motor_set(m, 0.0f, 0u);
-        }
         return;
     }
 
@@ -157,35 +162,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (++ctrl_cnt < ADC_N) return;
     ctrl_cnt = 0;
 
-    /* --- VÒNG LẶP ĐIỀU KHIỂN: 2 TRƯỜNG HỢP --- */
+    /* Đọc cảm biến, động cơ tắt */
     for (uint8_t m = 0; m < NUM_MOTORS; m++) {
-        // Đọc dòng điện và góc
         motors[m].current_mA = adc_to_mA((uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
-        motors[m].angle_rad = enc_to_rad(enc_read(m));
-
-        /* KIỂM TRA 2 TRƯỜNG HỢP (Ý tưởng của bạn) */
-        // Dùng một ngưỡng nhỏ (ví dụ 10mA) để lọc sạch các số rác từ Unity
-        if (fabsf(motors[m].current_ref_mA) < 5.0f) 
-        {
-            // TRƯỜNG HỢP 1: KHÔNG VA CHẠM (LÚC THƯỜNG)
-            // 1. Xóa sạch bộ nhớ tích phân PI để không bị cộng dồn nhiễu
-            motors[m].pi.integ = 0.0f; 
-            
-            // 2. Ép xuất thẳng PWM = 0 (Động cơ tắt hoàn toàn, thả lỏng)
-            motor_set(m, 0.0f, 0u);
-        }
-        else 
-        {
-            // TRƯỜNG HỢP 2: CÓ VA CHẠM (DÒNG ĐIỆN LỚN)
-            // 1. Tính toán sai số
-            float err = motors[m].current_ref_mA - motors[m].current_mA;
-            
-            // 2. Chạy bộ PI
-            float out = pi_calc(&motors[m].pi, err, TS);
-            
-            // 3. Xuất lực ra động cơ
-            motor_set(m, out >= 0.0f ? out : -out, out >= 0.0f ? 0u : 1u);
-        }
+        motors[m].angle_rad  = enc_to_rad(enc_read(m));
+        motor_set(m, 0.0f, 0u);
     }
 
     /* Gửi dữ liệu UART lên Unity */
@@ -196,65 +177,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 /* ════════════════════════════════════════════════════════════════
- *  CALLBACK – Out: Unity - UART - In: STM32
- * ════════════════════════════════════════════════════════════════ */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance != USART2) return;
-        
-    uint8_t b = rx_byte;
-    
-    // Bật lại ngắt nhận byte tiếp theo NGAY LẬP TỨC
-    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
-    
-    if (b == '\r') return;
-    if (b == '\n')
-    {
-        rx_line[rx_idx] = '\0';     /* null-terminate TRƯỚC \n — không lưu \n vào buffer */
-        rx_idx = 0;
-
-        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f;
-        if (parse_3int(rx_line, &v0, &v1, &v2))
-        {
-            float limit = (float)ICLAMP;
-            if (v0 >  limit) v0 =  limit; else if (v0 < -limit) v0 = -limit;
-            if (v1 >  limit) v1 =  limit; else if (v1 < -limit) v1 = -limit;
-            if (v2 >  limit) v2 =  limit; else if (v2 < -limit) v2 = -limit;
-            motors[0].current_ref_mA = v0 * GAIN;
-            motors[1].current_ref_mA = v1 * GAIN;
-            motors[2].current_ref_mA = v2 * GAIN;
-        }
-        return;
-    }
-
-    if (rx_idx < RX_SZ - 1)
-    {
-        rx_line[rx_idx++] = (char)b;
-    }
-    else
-    {
-        rx_idx = 0;     /* tràn buffer: bỏ frame lỗi, chờ frame mới */
-    }
-}
-/* ════════════════════════════════════════════════════════════════
  *  LOCAL FUNC
  * ════════════════════════════════════════════════════════════════ */
-
-/* Parse "±NNNN;±NNNN;±NNNN\n" — safe in ISR: no malloc, no locale, <50B stack */
-static uint8_t parse_3int(const char *s, float *v0, float *v1, float *v2)
-{
-    float *dst[3] = { v0, v1, v2 };
-    for (uint8_t i = 0; i < 3; i++) {
-        int32_t val = 0;
-        int8_t  neg = 0;
-        if (*s == '-') { neg = 1; s++; }
-        if (*s < '0' || *s > '9') return 0;
-        while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
-        *dst[i] = neg ? -(float)val : (float)val;
-        if (i < 2) { if (*s != ';') return 0; s++; }
-    }
-    return 1;
-}
 
 static float adc_to_mA(uint16_t raw, uint16_t offset)
 {
@@ -282,24 +206,6 @@ static int32_t enc_read(uint8_t m)
 static float enc_to_rad(int32_t cnt)
 {
     return (float)cnt / (float)COUNTS_PER_REV * (2.0f * (float)M_PI);
-}
-
-static float pi_calc(PI_t *pi, float err, float dt)
-{
-    /* Deadband ±150mA: lọc noise ADC, lực dưới ~1N không cảm nhận được */
-    if (fabsf(err) < 150.0f)
-    {
-        pi->integ = 0.0f;
-        return 0.0f;
-    }
-
-    pi->integ += err * dt;
-    if      (pi->integ >  pi->ilim) pi->integ =  pi->ilim;
-    else if (pi->integ < -pi->ilim) pi->integ = -pi->ilim;
-    float o = pi->Kp * err + pi->Ki * pi->integ;
-    if      (o >  pi->olim) o =  pi->olim;
-    else if (o < -pi->olim) o = -pi->olim;
-    return o;
 }
 
 static void motor_set(uint8_t m, float duty, uint8_t dir)
@@ -357,6 +263,37 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART2) dma_tx_busy = 0;
 }
 
+/* ── RX callback: nhận từng byte từ Unity, parse "v0;v1;v2\n" ─── */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART2) return;
+
+    char c = (char)rx_byte;
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   /* re-arm ngay lập tức */
+
+    if (c == '\n') {
+        rx_line[rx_idx] = '\0';
+        float v0, v1, v2;
+        if (rx_idx > 0u && parse_3int(rx_line, &v0, &v1, &v2)) {
+            rx_val[0] = v0;
+            rx_val[1] = v1;
+            rx_val[2] = v2;
+            rx_ready  = 1u;
+            log_rx_ok++;
+        } else {
+            log_rx_err++;
+        }
+        rx_idx = 0u;
+    } else if (c == '\r') {
+        /* bỏ qua CR nếu Unity gửi \r\n */
+    } else if (rx_idx < RX_SZ - 1u) {
+        rx_line[rx_idx++] = c;
+    } else {
+        rx_idx = 0u;   /* buffer tràn, reset và đếm lỗi */
+        log_rx_err++;
+    }
+}
+
 static void uart_send(void)
 {
     if (dma_tx_busy) return;   /* DMA còn bận, bỏ qua frame này */
@@ -371,9 +308,10 @@ static void uart_send(void)
     float c0 = motors[0].current_mA;
     float c1 = motors[1].current_mA;
     float c2 = motors[2].current_mA;
-    float r0 = motors[0].current_ref_mA;   /* DEBUG: ref Unity gửi xuống */
-    float r1 = motors[1].current_ref_mA;
-    float r2 = motors[2].current_ref_mA;
+    /* echo data nhận từ Unity — dùng để logging/xác nhận trên Unity console */
+    float v0 = rx_val[0];
+    float v1 = rx_val[1];
+    float v2 = rx_val[2];
 
     p += fmt_f2(p, d0); *p++ = ';';
     p += fmt_f2(p, d1); *p++ = ';';
@@ -381,9 +319,9 @@ static void uart_send(void)
     p += fmt_f2(p, c0); *p++ = ';';
     p += fmt_f2(p, c1); *p++ = ';';
     p += fmt_f2(p, c2); *p++ = ';';
-    p += fmt_f2(p, r0); *p++ = ';';
-    p += fmt_f2(p, r1); *p++ = ';';
-    p += fmt_f2(p, r2); *p++ = '\n';
+    p += fmt_f2(p, v0); *p++ = ';';
+    p += fmt_f2(p, v1); *p++ = ';';
+    p += fmt_f2(p, v2); *p++ = '\n';
 
     uint16_t len = (uint16_t)(p - tx_buf[buf]);
     tx_sel = buf;
@@ -392,29 +330,42 @@ static void uart_send(void)
         dma_tx_busy = 0;
 }
 
-/* ── System_Init: PI params + reset state ────────────────────── */
+/* ── System_Init: reset motor state + RX state ───────────────── */
 static void System_Init(void)
 {
-    const float Kp[NUM_MOTORS] = { 0.011f, 0.017f, 0.011f  };
-    const float Ki[NUM_MOTORS] = { 10.660f, 8.527f, 10.526f };
-
     for (uint8_t m = 0; m < NUM_MOTORS; m++) {
-        motors[m].pi = (PI_t){ Kp[m], Ki[m], 0.0f, PI_INT_MAX, PI_OUT_MAX };
-        motors[m].current_ref_mA = 0.0f;
-        motors[m].angle_rad      = 0.0f;
-        motors[m].duty           = 0.0f;
-        motors[m].dir            = 0u;
+        motors[m].angle_rad = 0.0f;
+        motors[m].duty      = 0.0f;
+        motors[m].dir       = 0u;
         for (uint16_t i = 0; i < ADC_N; i++) motors[m].adc[i] = 2048u;
     }
-    ctrl_cnt = 0u;
-    rx_idx   = 0u;
+    ctrl_cnt  = 0u;
+    rx_idx    = 0u;
+    rx_val[0] = 0.0f; rx_val[1] = 0.0f; rx_val[2] = 0.0f;
+    rx_ready  = 0u;
+}
+
+/* ── parse_3int: parse "±NNNNN;±NNNNN;±NNNNN" — ISR-safe ────── *
+ *  Không dùng sscanf/malloc/locale. Stack < 50 bytes.            */
+static uint8_t parse_3int(const char *s, float *v0, float *v1, float *v2)
+{
+    float *dst[3] = { v0, v1, v2 };
+    for (uint8_t i = 0; i < 3u; i++) {
+        int32_t val = 0; int8_t neg = 0;
+        if (*s == '-') { neg = 1; s++; }
+        if (*s < '0' || *s > '9') return 0;
+        while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
+        *dst[i] = neg ? -(float)val : (float)val;
+        if (i < 2u) { if (*s != ';') return 0; s++; }
+    }
+    return 1;
 }
 
 static void Calibrate_ADC_Offset(void)
 {
     HAL_Delay(1000);   /* chờ ADC DMA ổn định */
     uint32_t acc[NUM_MOTORS] = {0, 0, 0};
-    for (uint16_t s = 0; s < 1000u; s++) {
+    for (uint16_t s = 0; s < 2000u; s++) {
         for (uint8_t m = 0; m < NUM_MOTORS; m++)
             acc[m] += adc_dma[m];
         HAL_Delay(1);

@@ -147,27 +147,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         motors[m].current_mA = adc_to_mA((uint16_t)filter_avg(motors[m].adc, ADC_N), adc_offset[m]);
         motors[m].angle_rad = enc_to_rad(enc_read(m));
 
-        /* KIỂM TRA 2 TRƯỜNG HỢP (Ý tưởng của bạn) */
-        // Dùng một ngưỡng nhỏ (ví dụ 10mA) để lọc sạch các số rác từ Unity
-        if (fabsf(motors[m].current_ref_mA) < 5.0f) 
+        /* Ngưỡng 50mA: lọc nhiễu UART/ADC (< 50mA),
+         * nhưng vẫn cho qua bù trọng lực (~300-400mA) và lực va chạm */
+        if (fabsf(motors[m].current_ref_mA) < 50.0f)
         {
-            // TRƯỜNG HỢP 1: KHÔNG VA CHẠM (LÚC THƯỜNG)
-            // 1. Xóa sạch bộ nhớ tích phân PI để không bị cộng dồn nhiễu
-            motors[m].pi.integ = 0.0f; 
-            
-            // 2. Ép xuất thẳng PWM = 0 (Động cơ tắt hoàn toàn, thả lỏng)
+            /* TRƯỜNG HỢP 1: KHÔNG VA CHẠM
+             * Reset tích phân – tránh windup khi chuyển sang Case 2 */
+            motors[m].pi.integ = 0.0f;
             motor_set(m, 0.0f, 0u);
         }
-        else 
+        else
         {
-            // TRƯỜNG HỢP 2: CÓ VA CHẠM (DÒNG ĐIỆN LỚN)
-            // 1. Tính toán sai số
+            /* TRƯỜNG HỢP 2: CÓ VA CHẠM (bù trọng lực + lực tiếp xúc) */
             float err = motors[m].current_ref_mA - motors[m].current_mA;
-            
-            // 2. Chạy bộ PI
             float out = pi_calc(&motors[m].pi, err, TS);
-            
-            // 3. Xuất lực ra động cơ
             motor_set(m, out >= 0.0f ? out : -out, out >= 0.0f ? 0u : 1u);
         }
     }
@@ -215,6 +208,30 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         memset(rx_line, 0, RX_SZ);
         return;
     }
+    /* Lệnh test chiều quay: "T<m><s>\n"
+     * m = '1','2','3' (motor), s = '+' hoặc '-'
+     * Ví dụ: "T1+\n" → motor 1 nhận 300mA, "T2-\n" → motor 2 nhận -300mA
+     * Gửi "T0\n" để tắt test, trả về chế độ bình thường */
+    if (rx_line[0] == 'T')
+    {
+        if (rx_line[1] == '0')
+        {
+            motors[0].current_ref_mA = 0.0f;
+            motors[1].current_ref_mA = 0.0f;
+            motors[2].current_ref_mA = 0.0f;
+        }
+        else if (rx_line[1] >= '1' && rx_line[1] <= '3')
+        {
+            uint8_t m = (uint8_t)(rx_line[1] - '1');
+            float   s = (rx_line[2] == '-') ? -300.0f : 300.0f;
+            motors[0].current_ref_mA = (m == 0) ? s : 0.0f;
+            motors[1].current_ref_mA = (m == 1) ? s : 0.0f;
+            motors[2].current_ref_mA = (m == 2) ? s : 0.0f;
+        }
+        rx_idx = 0;
+        memset(rx_line, 0, RX_SZ);
+        return;
+    }
     float v0 = 0.0f;
     float v1 = 0.0f;
     float v2 = 0.0f;
@@ -234,10 +251,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if (v2 < -limit)
             v2 = -limit;
 
-        float hw_gain = 3.0f;
-        motors[0].current_ref_mA = (float)v0 * hw_gain;
-        motors[1].current_ref_mA = (float)v1* hw_gain;
-        motors[2].current_ref_mA = (float)v2* hw_gain;
+        /* IIR setpoint filter: làm mềm lệnh nhảy cấp từ Unity
+         * REF_ALPHA = 0.7 → τ_filter ≈ 4ms @100Hz (đủ nhanh cho haptic < 15ms)
+         * REF_ALPHA = 0.3 cũ → τ ≈ 28ms, quá chậm → lực cảm giác như không có */
+        static const float hw_gain   = 3.0f;
+        static const float REF_ALPHA = 0.7f;
+        motors[0].current_ref_mA = REF_ALPHA * (v0 * hw_gain) + (1.0f - REF_ALPHA) * motors[0].current_ref_mA;
+        motors[1].current_ref_mA = REF_ALPHA * (v1 * hw_gain) + (1.0f - REF_ALPHA) * motors[1].current_ref_mA;
+        motors[2].current_ref_mA = REF_ALPHA * (v2 * hw_gain) + (1.0f - REF_ALPHA) * motors[2].current_ref_mA;
     }
     rx_idx = 0;
 }
@@ -275,13 +296,9 @@ static float enc_to_rad(int32_t cnt)
 
 static float pi_calc(PI_t *pi, float err, float dt)
 {
-    /* Deadband ±50mA: destroy noise, reset Cumulative Integration */
-    if (fabsf(err) < 150.0f)
-    {
-        pi->integ = 0.0f;
-        return 0.0f;
-    }
-
+    /* Không dùng deadband trong PI: deadband + integ reset gây chatter
+     * (err nhỏ → reset → motor dừng → err lớn → chạy lại → không tạo được lực)
+     * Noise filter đã có ở tầng ADC (avg 100 mẫu). Anti-windup chỉ dùng clamp. */
     pi->integ += err * dt;
     if      (pi->integ >  pi->ilim) pi->integ =  pi->ilim;
     else if (pi->integ < -pi->ilim) pi->integ = -pi->ilim;
